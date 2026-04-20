@@ -82,6 +82,12 @@
                 @select-category="activeCategoryId = $event"
                 @color-change="updateCategoryColor"
               />
+              <n-divider />
+              <!-- 性能基准测试面板 -->
+              <BenchmarkPanel
+                :current-fps="currentFps"
+                :on-load-test-cloud="loadTestCloud"
+              />
             </n-scrollbar>
           </div>
         </div>
@@ -118,6 +124,7 @@ import AnnotationList from './AnnotationList.vue'
 import BoxProperties from './BoxProperties.vue'
 import LabelColorPicker from './LabelColorPicker.vue'
 import FrameNavigator from './FrameNavigator.vue'
+import BenchmarkPanel from './BenchmarkPanel.vue'
 import { usePointCloud } from '@/composables/usePointCloud'
 import { useAnnotation } from '@/composables/useAnnotation'
 import { useProject } from '@/composables/useProject'
@@ -132,6 +139,7 @@ const loadError = ref<string | null>(null)
 const activeCategoryId = ref(1)
 const colorMode = ref<ColorMode>('intensity')
 const pointSize = ref(2.0)
+const currentFps = ref(0)
 
 // ── Composables ────────────────────────────────────────────────────────────
 const { isLoading, progress, error: pcError, pointCloud, loadFile, loadURL: loadURLFn } = usePointCloud()
@@ -165,6 +173,20 @@ function onSceneReady(scene: ReturnType<typeof useScene>): void {
       sceneRef?.updateSemanticColors(colors)
     }
   })
+
+  // 同步 FPS 到本地 ref（供 BenchmarkPanel 使用）
+  setInterval(() => {
+    currentFps.value = sceneRef?.fps ?? 0
+  }, 500)
+}
+
+/** 基准测试：加载生成的测试点云到渲染器 */
+function loadTestCloud(positions: Float32Array, intensities: Float32Array, count: number): void {
+  if (!sceneRef) return
+  sceneRef.loadPointCloud({ positions, intensities, count })
+  labelManager.initPointLabels(count)
+  updatePositions(positions)
+  clearAnnotations()
 }
 
 // ── Point cloud loading ────────────────────────────────────────────────────
