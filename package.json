@@ -1,0 +1,34 @@
+{
+  "name": "pointcloud-viewer",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc && vite build",
+    "preview": "vite preview",
+    "test": "vitest --run",
+    "test:watch": "vitest",
+    "coverage": "vitest run --coverage"
+  },
+  "devDependencies": {
+    "@types/three": "^0.184.0",
+    "@vitejs/plugin-vue": "^6.0.6",
+    "@vitest/coverage-v8": "^4.1.4",
+    "@vue/test-utils": "^2.4.6",
+    "fast-check": "^4.7.0",
+    "jsdom": "^29.0.2",
+    "typescript": "~6.0.2",
+    "vite": "^8.0.4",
+    "vitest": "^4.1.4",
+    "vitest-canvas-mock": "^1.1.4"
+  },
+  "dependencies": {
+    "@loaders.gl/core": "^4.4.1",
+    "@loaders.gl/las": "^4.4.1",
+    "@math.gl/types": "^4.1.0",
+    "jszip": "^3.10.1",
+    "naive-ui": "^2.44.1",
+    "three": "^0.184.0"
+  }
+}
