@@ -85,7 +85,7 @@
               <n-divider />
               <!-- 性能基准测试面板 -->
               <BenchmarkPanel
-                :current-fps="currentFps"
+                :get-fps="() => sceneRef?.fps ?? 0"
                 :on-load-test-cloud="loadTestCloud"
               />
             </n-scrollbar>
@@ -139,7 +139,6 @@ const loadError = ref<string | null>(null)
 const activeCategoryId = ref(1)
 const colorMode = ref<ColorMode>('intensity')
 const pointSize = ref(2.0)
-const currentFps = ref(0)
 
 // ── Composables ────────────────────────────────────────────────────────────
 const { isLoading, progress, error: pcError, pointCloud, loadFile, loadURL: loadURLFn } = usePointCloud()
@@ -173,11 +172,6 @@ function onSceneReady(scene: ReturnType<typeof useScene>): void {
       sceneRef?.updateSemanticColors(colors)
     }
   })
-
-  // 同步 FPS 到本地 ref（供 BenchmarkPanel 使用）
-  setInterval(() => {
-    currentFps.value = sceneRef?.fps ?? 0
-  }, 500)
 }
 
 /** 基准测试：加载生成的测试点云到渲染器 */

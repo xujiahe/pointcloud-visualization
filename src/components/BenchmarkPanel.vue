@@ -116,8 +116,44 @@
 <script setup lang="ts">
 import { ref } from 'vue'
 import { NButton, NSelect, NProgress } from 'naive-ui'
-import { runBenchmark, generateMockPointCloud } from '@/utils/PerformanceBenchmark'
+import { generateMockPointCloud } from '@/utils/PerformanceBenchmark'
 import type { BenchmarkResult } from '@/utils/PerformanceBenchmark'
+
+/** 读取 JS 堆内存（MB），仅 Chrome 支持 */
+function getHeapMB(): number {
+  const perf = performance as Performance & { memory?: { usedJSHeapSize: number } }
+  return perf.memory ? perf.memory.usedJSHeapSize / 1024 / 1024 : 0
+}
+
+/** 模拟颜色映射（用于测量耗时） */
+function buildColors(intensities: Float32Array, positions: Float32Array, count: number): Float32Array {
+  const colors = new Float32Array(count * 3)
+  let minI = Infinity, maxI = -Infinity
+  for (let i = 0; i < count; i++) {
+    if (intensities[i] < minI) minI = intensities[i]
+    if (intensities[i] > maxI) maxI = intensities[i]
+  }
+  const range = maxI - minI || 1
+  for (let i = 0; i < count; i++) {
+    const v = (intensities[i] - minI) / range
+    colors[i * 3]     = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * v - 3)))
+    colors[i * 3 + 1] = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * v - 2)))
+    colors[i * 3 + 2] = Math.max(0, Math.min(1, 1.5 - Math.abs(4 * v - 1)))
+  }
+  void positions  // 避免 unused 警告
+  return colors
+}
+
+function formatSummary(r: BenchmarkResult): string {
+  const M = (r.pointCount / 1_000_000).toFixed(1)
+  return [
+    `═══ 点云性能基准 (${M}M 点) ═══`,
+    `解析: ${r.parseTimeMs}ms  颜色: ${r.colorBuildTimeMs}ms`,
+    `内存增量: ${r.memDeltaMB}MB (理论 ${r.expectedMemMB}MB)`,
+    `FPS: avg=${r.avgFps} min=${r.minFps} max=${r.maxFps}`,
+    `达标(≥30fps): ${r.avgFps >= 30 ? '✅' : '❌'}`,
+  ].join('\n')
+}
 
 const props = defineProps<{
   /** 获取当前 FPS 的函数（由父组件提供） */
@@ -146,28 +182,60 @@ async function runTest(): Promise<void> {
   result.value = null
 
   try {
-    // 阶段 1：生成测试数据并加载到渲染器（20%）
+    // ── 阶段 1：内存基线（解析前）──────────────────────────────
+    const memBefore = getHeapMB()
     progress.value = 10
+
+    // ── 阶段 2：生成点云并加载到渲染器 ────────────────────────
+    const parseStart = performance.now()
     const { positions, intensities } = generateMockPointCloud(selectedCount.value)
+    const parseTimeMs = Math.round(performance.now() - parseStart)
     progress.value = 30
 
-    // 通知父组件加载点云到 Three.js 场景
+    const memAfter = getHeapMB()
+
+    // 颜色映射耗时
+    const colorStart = performance.now()
+    buildColors(intensities, positions, selectedCount.value)
+    const colorBuildTimeMs = Math.round(performance.now() - colorStart)
+
+    // 加载到 Three.js 场景
     props.onLoadTestCloud?.(positions, intensities, selectedCount.value)
     progress.value = 50
 
-    // 阶段 2：等待渲染稳定（1.5 秒预热）
-    await new Promise(r => setTimeout(r, 1500))
-    progress.value = 65
+    // ── 阶段 3：等待渲染稳定（2 秒预热）──────────────────────
+    await new Promise(r => setTimeout(r, 2000))
+    progress.value = 60
 
-    // 阶段 3：采集 FPS（3 秒窗口）
+    // ── 阶段 4：用 rAF 精确采集 FPS（3 秒窗口）───────────────
     const fpsSamples: number[] = []
-    const sampleInterval = setInterval(() => {
-      fpsSamples.push(props.currentFps)
-    }, 200)
+    let collecting = true
+    let lastTime = performance.now()
+    let frameCount = 0
+
+    const collectFps = () => {
+      if (!collecting) return
+      frameCount++
+      const now = performance.now()
+      if (now - lastTime >= 500) {
+        // 每 500ms 计算一次瞬时 FPS
+        const instantFps = Math.round(frameCount / ((now - lastTime) / 1000))
+        if (instantFps > 0) fpsSamples.push(instantFps)
+        frameCount = 0
+        lastTime = now
+        progress.value = 60 + Math.min(30, fpsSamples.length * 5)
+      }
+      requestAnimationFrame(collectFps)
+    }
+    requestAnimationFrame(collectFps)
 
     await new Promise(r => setTimeout(r, 3000))
-    clearInterval(sampleInterval)
-    progress.value = 90
+    collecting = false
+    progress.value = 95
+
+    // 也读取渲染器自身的 FPS（作为补充）
+    const rendererFps = props.getFps()
+    if (rendererFps > 0) fpsSamples.push(rendererFps)
 
     const validSamples = fpsSamples.filter(f => f > 0)
     const avgFps = validSamples.length
@@ -176,24 +244,42 @@ async function runTest(): Promise<void> {
     const minFps = validSamples.length ? Math.min(...validSamples) : 0
     const maxFps = validSamples.length ? Math.max(...validSamples) : 0
 
-    // 阶段 4：运行基准测试（含内存和耗时测量）
-    const r = await runBenchmark(selectedCount.value, async () => ({
-      avg: avgFps, min: minFps, max: maxFps,
-    }))
+    // ── 阶段 5：组装结果 ──────────────────────────────────────
+    const expectedMemMB = Math.round(
+      (selectedCount.value * 3 * 4 + selectedCount.value * 4 + selectedCount.value * 3 * 4)
+      / 1024 / 1024 * 10
+    ) / 10
+
+    const r: BenchmarkResult = {
+      pointCount: selectedCount.value,
+      parseTimeMs,
+      memBeforeMB: Math.round(memBefore * 10) / 10,
+      memAfterMB:  Math.round(memAfter * 10) / 10,
+      memDeltaMB:  Math.round((memAfter - memBefore) * 10) / 10,
+      expectedMemMB,
+      colorBuildTimeMs,
+      gpuUploadTimeMs: 0,  // Three.js 内部，无法直接测量
+      avgFps,
+      minFps,
+      maxFps,
+      summary: '',
+    }
+    r.summary = formatSummary(r)
 
     result.value = r
     history.value.push(r)
     progress.value = 100
 
-    // 打印到控制台（便于截图记录）
     console.log(r.summary)
     console.table({
-      '点数量': r.pointCount.toLocaleString(),
-      '解析耗时(ms)': r.parseTimeMs,
+      '点数量':       r.pointCount.toLocaleString(),
+      '解析(ms)':     r.parseTimeMs,
       '颜色映射(ms)': r.colorBuildTimeMs,
       '内存增量(MB)': r.memDeltaMB,
-      '平均FPS': r.avgFps,
-      '最低FPS': r.minFps,
+      '理论内存(MB)': r.expectedMemMB,
+      '平均FPS':      r.avgFps,
+      '最低FPS':      r.minFps,
+      'FPS采样数':    validSamples.length,
     })
 
   } finally {
