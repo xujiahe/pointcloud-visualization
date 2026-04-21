@@ -6,6 +6,52 @@ import {
   buildHeightColors,
 } from './ColorMapping'
 import { LODManager } from './LODManager'
+import { FrustumCuller } from './FrustumCuller'
+import { Octree } from './Octree'
+
+// Shader 代码
+const vertexShader = `
+attribute float intensity;
+attribute float height;
+uniform int uColorMode;      // 0=intensity 1=height 2=semantic
+uniform float uMinVal;
+uniform float uMaxVal;
+uniform float uPointSize;
+
+varying vec3 vColor;
+
+vec3 jetColormap(float v) {
+  v = clamp(v, 0.0, 1.0);
+  return vec3(
+    clamp(1.5 - abs(4.0*v - 3.0), 0.0, 1.0),
+    clamp(1.5 - abs(4.0*v - 2.0), 0.0, 1.0),
+    clamp(1.5 - abs(4.0*v - 1.0), 0.0, 1.0)
+  );
+}
+
+void main() {
+  float raw = (uColorMode == 0) ? intensity : height;
+  float normalized = (uMaxVal > uMinVal)
+    ? (raw - uMinVal) / (uMaxVal - uMinVal)
+    : 0.0;
+  vColor = jetColormap(normalized);
+
+  gl_PointSize = uPointSize;
+  gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+}
+`
+
+const fragmentShader = `
+varying vec3 vColor;
+
+void main() {
+  // 圆形点（可选）
+  float r = distance(gl_PointCoord, vec2(0.5, 0.5));
+  if (r > 0.5) discard;
+
+  gl_FragColor = vec4(vColor, 1.0);
+}
+`
 
 export class PointCloudRenderer {
   private scene!: THREE.Scene
@@ -16,6 +62,8 @@ export class PointCloudRenderer {
   private geometry: THREE.BufferGeometry | null = null
   private animationId: number | null = null
   private lodManager = new LODManager()
+  private frustumCuller = new FrustumCuller()
+  private octree = new Octree()
 
   // 性能监控
   private _fps = 0
@@ -33,6 +81,9 @@ export class PointCloudRenderer {
 
   // 语义颜色（外部传入）
   private semanticColors: Float32Array | null = null
+
+  // 视锥裁剪相关
+  private needsFrustumUpdate = false
 
   get fps(): number { return this._fps }
   get renderedPointCount(): number { return this._renderedPointCount }
@@ -66,6 +117,11 @@ export class PointCloudRenderer {
     this.controls.minDistance = 0.1
     this.controls.maxDistance = 1000
 
+    // 监听相机变化
+    this.controls.addEventListener('change', () => {
+      this.needsFrustumUpdate = true
+    })
+
     // 坐标轴辅助
     const axesHelper = new THREE.AxesHelper(5)
     this.scene.add(axesHelper)
@@ -81,25 +137,35 @@ export class PointCloudRenderer {
   loadPointCloud(data: ParsedPointCloud): void {
     this.currentData = data
     this._totalPointCount = data.count
+
+    // 构建八叉树（一次性）
+    this.octree.build(data.positions)
+
     this.rebuildGeometry()
   }
 
   setColorMode(mode: ColorMode): void {
     this.currentColorMode = mode
-    if (this.currentData) this.rebuildColors()
+    this.updateShaderUniforms()
   }
 
   setPointSize(size: number): void {
     this.currentPointSize = Math.max(0.5, Math.min(10, size))
     if (this.pointsMesh) {
-      (this.pointsMesh.material as THREE.PointsMaterial).size = this.currentPointSize
+      const material = this.pointsMesh.material
+      if (material instanceof THREE.PointsMaterial) {
+        material.size = this.currentPointSize
+      } else if (material instanceof THREE.ShaderMaterial) {
+        material.uniforms.uPointSize.value = this.currentPointSize
+      }
     }
   }
 
   updateSemanticColors(colors: Float32Array): void {
     this.semanticColors = colors
+    // 对于 semantic 模式，需要重建 geometry 以使用 PointsMaterial
     if (this.currentColorMode === 'semantic') {
-      this.rebuildColors()
+      this.rebuildGeometry()
     }
   }
 
@@ -137,64 +203,72 @@ export class PointCloudRenderer {
       ;(this.pointsMesh.material as THREE.Material).dispose()
     }
 
-    const renderCount = this.lodManager.computeRenderCount(
-      this.currentData.count,
-      this._performanceDegraded
-    )
-    this._renderedPointCount = renderCount
+    // 更新视锥
+    this.frustumCuller.update(this.camera)
 
-    // 如果需要 LOD，生成降采样索引
-    let positions: Float32Array
-    let intensities: Float32Array
+    // 获取可见点索引
+    const visibleIndices = this.octree.queryFrustum(this.frustumCuller['frustum'])
 
-    if (renderCount < this.currentData.count) {
-      const indices = this.lodManager.buildLODIndex(this.currentData.count, renderCount)
-      positions = new Float32Array(renderCount * 3)
-      intensities = new Float32Array(renderCount)
-      for (let i = 0; i < renderCount; i++) {
-        const src = indices[i]
-        positions[i * 3]     = this.currentData.positions[src * 3]
-        positions[i * 3 + 1] = this.currentData.positions[src * 3 + 1]
-        positions[i * 3 + 2] = this.currentData.positions[src * 3 + 2]
-        intensities[i]        = this.currentData.intensities[src]
-      }
-    } else {
-      positions = this.currentData.positions
-      intensities = this.currentData.intensities
+    // 应用 LOD 到可见点
+    const lodIndices = this.lodManager.buildLODIndex(visibleIndices.length, 
+      this.lodManager.computeRenderCount(visibleIndices.length, this._performanceDegraded))
+
+    // 映射回原始索引
+    const finalIndices = new Uint32Array(lodIndices.length)
+    for (let i = 0; i < lodIndices.length; i++) {
+      finalIndices[i] = visibleIndices[lodIndices[i]]
+    }
+
+    this._renderedPointCount = finalIndices.length
+
+    // 构建 geometry
+    const positions = new Float32Array(finalIndices.length * 3)
+    const intensities = new Float32Array(finalIndices.length)
+    const heights = new Float32Array(finalIndices.length)
+
+    for (let i = 0; i < finalIndices.length; i++) {
+      const src = finalIndices[i]
+      positions[i * 3]     = this.currentData.positions[src * 3]
+      positions[i * 3 + 1] = this.currentData.positions[src * 3 + 1]
+      positions[i * 3 + 2] = this.currentData.positions[src * 3 + 2]
+      intensities[i]        = this.currentData.intensities[src]
+      heights[i]            = this.currentData.positions[src * 3 + 2]
     }
 
     this.geometry = new THREE.BufferGeometry()
     this.geometry.setAttribute('position', new THREE.BufferAttribute(positions, 3))
 
-    // 构建颜色
-    const colors = this.buildColors(positions, intensities, renderCount)
-    this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+    // 构建颜色或设置 shader uniforms
+    let material: THREE.Material
+    if (this.currentColorMode === 'semantic' && this.semanticColors) {
+      // Semantic 模式使用 PointsMaterial
+      const colors = this.buildColors(positions, intensities, finalIndices.length)
+      this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
+      material = new THREE.PointsMaterial({
+        size: this.currentPointSize,
+        vertexColors: true,
+        sizeAttenuation: true,
+      })
+    } else {
+      // 其他模式使用 ShaderMaterial
+      this.geometry.setAttribute('intensity', new THREE.BufferAttribute(intensities, 1))
+      this.geometry.setAttribute('height', new THREE.BufferAttribute(heights, 1))
 
-    const material = new THREE.PointsMaterial({
-      size: this.currentPointSize,
-      vertexColors: true,
-      sizeAttenuation: true,
-    })
+      const colorRanges = this.computeColorRanges(intensities, heights)
+      material = new THREE.ShaderMaterial({
+        vertexShader,
+        fragmentShader,
+        uniforms: {
+          uColorMode: { value: this.getColorModeIndex(this.currentColorMode) },
+          uMinVal: { value: colorRanges.min },
+          uMaxVal: { value: colorRanges.max },
+          uPointSize: { value: this.currentPointSize },
+        },
+      })
+    }
 
     this.pointsMesh = new THREE.Points(this.geometry, material)
     this.scene.add(this.pointsMesh)
-  }
-
-  private rebuildColors(): void {
-    if (!this.geometry || !this.currentData) return
-    const posAttr = this.geometry.getAttribute('position') as THREE.BufferAttribute
-    const count = posAttr.count
-    const positions = posAttr.array as Float32Array
-
-    // 重建 intensities（从原始数据中取对应点）
-    const intensities = new Float32Array(count)
-    if (count === this.currentData.count) {
-      intensities.set(this.currentData.intensities)
-    }
-
-    const colors = this.buildColors(positions, intensities, count)
-    this.geometry.setAttribute('color', new THREE.BufferAttribute(colors, 3))
-    ;(this.geometry.getAttribute('color') as THREE.BufferAttribute).needsUpdate = true
   }
 
   private buildColors(
@@ -242,6 +316,12 @@ export class PointCloudRenderer {
         this.checkPerformanceDegradation()
       }
 
+      // 视锥裁剪更新
+      if (this.needsFrustumUpdate && this.currentData) {
+        this.rebuildGeometry()
+        this.needsFrustumUpdate = false
+      }
+
       this.controls?.update()
       this.renderer.render(this.scene, this.camera)
     }
@@ -260,6 +340,49 @@ export class PointCloudRenderer {
     } else if (!allLow && wasDegrade) {
       this._performanceDegraded = false
       this.rebuildGeometry()  // 恢复全量渲染
+    }
+  }
+
+  private computeColorRanges(intensities: Float32Array, heights: Float32Array): { min: number, max: number } {
+    if (this.currentColorMode === 'intensity') {
+      let min = Infinity, max = -Infinity
+      for (let i = 0; i < intensities.length; i++) {
+        min = Math.min(min, intensities[i])
+        max = Math.max(max, intensities[i])
+      }
+      return { min, max }
+    } else if (this.currentColorMode === 'height') {
+      let min = Infinity, max = -Infinity
+      for (let i = 0; i < heights.length; i++) {
+        min = Math.min(min, heights[i])
+        max = Math.max(max, heights[i])
+      }
+      return { min, max }
+    }
+    return { min: 0, max: 1 }
+  }
+
+  private getColorModeIndex(mode: ColorMode): number {
+    switch (mode) {
+      case 'intensity': return 0
+      case 'height': return 1
+      case 'semantic': return 2
+      default: return 0
+    }
+  }
+
+  private updateShaderUniforms(): void {
+    if (!this.pointsMesh || !(this.pointsMesh.material instanceof THREE.ShaderMaterial)) return
+
+    const material = this.pointsMesh.material as THREE.ShaderMaterial
+    material.uniforms.uColorMode.value = this.getColorModeIndex(this.currentColorMode)
+
+    if (this.geometry) {
+      const intensities = (this.geometry.getAttribute('intensity') as THREE.BufferAttribute).array as Float32Array
+      const heights = (this.geometry.getAttribute('height') as THREE.BufferAttribute).array as Float32Array
+      const ranges = this.computeColorRanges(intensities, heights)
+      material.uniforms.uMinVal.value = ranges.min
+      material.uniforms.uMaxVal.value = ranges.max
     }
   }
 }

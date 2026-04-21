@@ -1,5 +1,6 @@
 import { ref, shallowRef, onUnmounted } from 'vue'
 import { DataLoader } from '@/core/Parsers/DataLoader'
+import { PointCloudCache } from '@/core/Renderer/PointCloudCache'
 import type { ParsedPointCloud, WorkerRequest, WorkerResponse } from '@/types'
 
 export function usePointCloud() {
@@ -11,6 +12,7 @@ export function usePointCloud() {
   let worker: Worker | null = null
   let abortController: AbortController | null = null
   const loader = new DataLoader()
+  const cache = new PointCloudCache()
 
   function createWorker(): Worker {
     return new Worker(
@@ -56,7 +58,8 @@ export function usePointCloud() {
     try {
       const format = loader.detectFormat(file.name)
       if (format === 'unsupported') throw new Error(`Unsupported format: ${file.name}`)
-      // 先读取 ArrayBuffer（主线程），再交给 Worker 解析
+
+      // 计算文件 hash 用于缓存
       const buffer = await new Promise<ArrayBuffer>((resolve, reject) => {
         const reader = new FileReader()
         reader.onprogress = (e) => {
@@ -68,7 +71,20 @@ export function usePointCloud() {
         reader.readAsArrayBuffer(file)
       })
 
-      pointCloud.value = await parseInWorker(buffer, format)
+      const hash = await cache.computeHash(buffer)
+
+      // 检查缓存
+      const cached = await cache.get(hash)
+      if (cached) {
+        pointCloud.value = cached
+        progress.value = 100
+        return
+      }
+
+      // 解析并缓存
+      const parsed = await parseInWorker(buffer, format)
+      await cache.set(hash, parsed)
+      pointCloud.value = parsed
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         error.value = null
@@ -92,6 +108,7 @@ export function usePointCloud() {
       const filename = url.split('/').pop() ?? url
       const format = loader.detectFormat(filename)
       if (format === 'unsupported') throw new Error(`Unsupported format: ${filename}`)
+
       const response = await fetch(url, { signal: abortController.signal })
       if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`)
 
@@ -114,8 +131,20 @@ export function usePointCloud() {
       let offset = 0
       for (const chunk of chunks) { buffer.set(chunk, offset); offset += chunk.byteLength }
 
-      // 转交 Worker 解析（Transferable 零拷贝）
-      pointCloud.value = await parseInWorker(buffer.buffer, format)
+      const hash = await cache.computeHash(buffer.buffer)
+
+      // 检查缓存
+      const cached = await cache.get(hash)
+      if (cached) {
+        pointCloud.value = cached
+        progress.value = 100
+        return
+      }
+
+      // 解析并缓存
+      const parsed = await parseInWorker(buffer.buffer, format)
+      await cache.set(hash, parsed)
+      pointCloud.value = parsed
     } catch (err) {
       if (err instanceof DOMException && err.name === 'AbortError') {
         error.value = null
